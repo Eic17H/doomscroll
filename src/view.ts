@@ -1232,6 +1232,27 @@ export class DoomscrollView extends ItemView {
     card.setAttribute('role', 'article');
     card.tabIndex = -1;
     card.setAttribute('aria-label', preview.title);
+
+    // ── NEW: apply the note's own CSS classes to the card ──
+    const noteFile = this.app.vault.getAbstractFileByPath(preview.path);
+    if (noteFile instanceof TFile) {
+      const cache = this.app.metadataCache.getFileCache(noteFile);
+      const raw = cache?.frontmatter?.cssclasses;
+      const classes = Array.isArray(raw)
+        ? raw
+        : typeof raw === 'string'
+          ? [raw]
+          : [];
+      const safeClasses = classes.filter(
+        (c): c is string =>
+          typeof c === 'string' && /^[a-zA-Z_][\w-]*$/.test(c)
+      );
+      if (safeClasses.length > 0) {
+        card.classList.add(...safeClasses);
+      }
+    }
+    // ────────────────────────────────────────────────────────
+
     const inlineAttachmentPreview =
       preview.attachment &&
       (isImagePath(preview.path) ||
