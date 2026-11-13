@@ -4,6 +4,7 @@ import {
   EventRef,
   Events,
   MarkdownRenderer,
+  Menu,
   Platform,
   Scope,
   WorkspaceLeaf,
@@ -65,6 +66,7 @@ interface AppWithSettings {
 }
 
 interface DoomscrollViewState {
+  feedId: string;
   batchPaths: string[];
   batchHistoryPaths: string[][];
   batchHistoryCursor: number;
@@ -100,7 +102,6 @@ export class DoomscrollView extends ItemView {
   private imageLoadListeners = new WeakSet<HTMLImageElement>();
   batchHistory: NotePreview[][] = [];
   batchHistoryCursor: number = -1;
-  backButton: HTMLButtonElement | null = null;
   private refreshStatusEl: HTMLElement | null = null;
   private isRefreshing = false;
   private pendingSettingsRefresh = false;
@@ -119,6 +120,7 @@ export class DoomscrollView extends ItemView {
   private isClosed = false;
   private pluginRefreshTimer: number | null = null;
   private pluginRefreshExcludePaths = new Set<string>();
+  private feedId = 'default';
 
   constructor(leaf: WorkspaceLeaf, plugin: DoomscrollPlugin) {
     super(leaf);
@@ -178,6 +180,14 @@ export class DoomscrollView extends ItemView {
         });
       }
     };
+    if (__DEBUG__) {
+      bind([','], () => {
+        this.plugin.debugSettingsFeedId = this.feedId;
+        const { setting } = this.plugin.app as unknown as AppWithSettings;
+        setting.open();
+        setting.openTabById('doomscroll');
+      });
+    }
     bind(['j', 'ArrowDown'], () => this.moveCardFocus(1));
     bind(['k', 'ArrowUp'], () => this.moveCardFocus(-1));
     bind(['Enter', 'o'], () => this.openFocusedCard());
@@ -351,7 +361,11 @@ export class DoomscrollView extends ItemView {
   }
 
   getDisplayText(): string {
-    return 'Doomscroll';
+    return this.plugin.getFeedFilters(this.feedId).name.trim() || 'Doomscroll';
+  }
+
+  getFeedId(): string {
+    return this.feedId;
   }
 
   getIcon(): string {
@@ -364,6 +378,7 @@ export class DoomscrollView extends ItemView {
       body ? body.scrollTop : this.restoredScrollTop;
 
     return {
+      feedId: this.feedId,
       batchPaths: this.currentBatch.map((preview) => preview.path),
       batchHistoryPaths: this.batchHistory.map((batch) =>
         batch.map((preview) => preview.path)
@@ -380,6 +395,8 @@ export class DoomscrollView extends ItemView {
     const restored = parseViewState(state);
     if (!restored) return;
 
+    this.feedId = this.plugin.resolveFeedId(restored.feedId);
+    this.updateFeedTitle();
     const previousBatch = this.currentBatch;
     const previousPaths = previousBatch.map((preview) => preview.path);
     const restoredBatch = this.resolvePreviewPaths(restored.batchPaths);
@@ -437,6 +454,32 @@ export class DoomscrollView extends ItemView {
       return;
     }
     await this.render();
+  }
+
+  async activateFeed(feedId: string): Promise<void> {
+    if (feedId === this.feedId) {
+      await this.refreshForCurrentSettings();
+      return;
+    }
+
+    this.feedId = feedId;
+    this.updateFeedTitle();
+    this.currentBatch = [];
+    this.batchHistory = [];
+    this.batchHistoryCursor = -1;
+    this.batchSettingsKey = null;
+    this.focusedPath = null;
+    this.restoredScrollTop = 0;
+    this.restoredScrollAnchor = null;
+    this.containerEl
+      .querySelector<HTMLElement>('.doomscroll-body')
+      ?.setAttribute(
+        'aria-label',
+        this.plugin.getFeedFilters(feedId).name.trim() || 'Doomscroll'
+      );
+    if (this.hasRendered) {
+      await this.refreshForCurrentSettings();
+    }
   }
 
   private resumeRenderedView(): void {
@@ -543,10 +586,19 @@ export class DoomscrollView extends ItemView {
     let indexRefreshed = false;
     let refreshFailed = false;
     try {
-      indexRefreshed = await this.plugin.indexer.refreshIfStale();
+      indexRefreshed = await this.plugin.indexer.refreshIfStale(
+        undefined,
+        false,
+        this.getActiveFeedFilters(),
+        this.feedId
+      );
       if (this.batchSettingsKey !== this.getBatchSettingsKey()) {
-        indexRefreshed =
-          (await this.plugin.indexer.refreshIfStale()) || indexRefreshed;
+        indexRefreshed = (await this.plugin.indexer.refreshIfStale(
+          undefined,
+          false,
+          this.getActiveFeedFilters(),
+          this.feedId
+        )) || indexRefreshed;
       }
     } catch (error) {
       console.error('Error refreshing vault index:', error);
@@ -617,7 +669,10 @@ export class DoomscrollView extends ItemView {
     // Body - scrollable container
     const bodyContainer = this.containerEl.createDiv('doomscroll-body');
     bodyContainer.setAttribute('role', 'feed');
-    bodyContainer.setAttribute('aria-label', 'Doomscroll');
+    bodyContainer.setAttribute(
+      'aria-label',
+      this.plugin.getFeedFilters(this.feedId).name.trim() || 'Doomscroll'
+    );
     bodyContainer.tabIndex = 0;
     bodyContainer.addEventListener(
       'scroll',
@@ -647,8 +702,8 @@ export class DoomscrollView extends ItemView {
     );
 
     const title = header.createEl('h2');
-    title.textContent = 'Doomscroll';
     title.className = 'doomscroll-title';
+    title.textContent = this.getDisplayText();
 
     this.refreshStatusEl = header.createDiv('doomscroll-refresh-status');
     this.refreshStatusEl.setAttribute('aria-live', 'polite');
@@ -663,36 +718,64 @@ export class DoomscrollView extends ItemView {
       void this.showNewBatch();
     });
 
-    // Previous batch button
-    this.backButton = controls.createEl('button');
-    this.backButton.className = 'doomscroll-back-btn';
-    this.backButton.setAttribute('aria-label', 'Previous card set');
-    setIcon(this.backButton, 'arrow-left');
-    this.backButton.addEventListener('click', () => {
-      void this.showPreviousBatch();
-    });
-    this.updateBackButton();
-
     // Settings button
     const settingsBtn = controls.createEl('button');
     settingsBtn.className = 'doomscroll-settings-btn';
-    settingsBtn.setAttribute('aria-label', 'Settings');
-    setIcon(settingsBtn, 'settings');
+    settingsBtn.setAttribute('aria-label', 'Choose feed or open settings');
+    setIcon(settingsBtn, 'chevron-down');
     settingsBtn.addEventListener('click', () => {
-      const { setting } = this.plugin.app as unknown as AppWithSettings;
-      setting.open();
-      setting.openTabById('doomscroll');
+      const menu = new Menu().setUseNativeMenu(false);
+      const feeds = [
+        { id: 'default', filters: this.plugin.data.settings },
+        ...this.plugin.data.settings.additionalFeeds.map((filters) => ({ id: filters.id, filters })),
+      ];
+      for (const feed of feeds) {
+        menu.addItem((item) => {
+          item.setTitle(feed.filters.name.trim() || 'Untitled feed');
+          item.setChecked(feed.filters === this.getActiveFeedFilters());
+          item.onClick(() => { void this.activateFeed(feed.id); });
+        });
+      }
+      menu.addSeparator();
+      const canUndoRefresh = this.batchHistoryCursor >= 0 && this.batchHistoryCursor < this.batchHistory.length - 1;
+      menu.addItem((item) => item
+        .setTitle('Back to previous notes')
+        .setDisabled(!canUndoRefresh)
+        .onClick(() => { void this.showPreviousBatch(); })
+      );
+      menu.addSeparator();
+      menu.addItem((item) => item.setTitle('Settings').onClick(() => {
+        const { setting } = this.plugin.app as unknown as AppWithSettings;
+        setting.open();
+        setting.openTabById('doomscroll');
+      }));
+      const buttonRect = settingsBtn.getBoundingClientRect();
+      const centerX = buttonRect.left + buttonRect.width / 2;
+      const top = buttonRect.bottom + 8;
+      menu.showAtPosition({ x: centerX, y: top });
+      window.setTimeout(() => {
+        const menuEl = (menu as unknown as { dom: HTMLElement }).dom;
+        if (!menuEl?.isConnected) return;
+        const margin = 8;
+        const left = Math.max(
+          margin,
+          Math.min(centerX - menuEl.offsetWidth / 2, window.innerWidth - menuEl.offsetWidth - margin)
+        );
+        menuEl.style.left = `${left}px`;
+        menuEl.style.top = `${top}px`;
+      }, 0);
     });
 
     // Refresh on every plugin session so a persisted index cannot outlive the
     // filters that were active when it was created. The indexer also detects
     // filter changes made while the plugin is running.
-    const needsInitialIndex = Object.keys(this.plugin.data.previews).length === 0;
+    const needsInitialIndex =
+      Object.keys(this.plugin.getFeedPreviews(this.feedId)).length === 0;
     const loadingEl = needsInitialIndex
       ? bodyContainer.createDiv('doomscroll-loading')
       : null;
     if (loadingEl) {
-      loadingEl.textContent = 'Indexing your vault…';
+      loadingEl.textContent = 'Preparing your notes…';
     }
 
     let indexRefreshed = false;
@@ -702,10 +785,12 @@ export class DoomscrollView extends ItemView {
       indexRefreshed = await this.plugin.indexer.refreshIfStale(
         (done, total) => {
           if (loadingEl) {
-            loadingEl.textContent = `Indexed ${done}/${total}`;
+            loadingEl.textContent = `Prepared ${done}/${total} notes`;
           }
         },
-        needsInitialIndex
+        needsInitialIndex,
+        this.getActiveFeedFilters(),
+        this.feedId
       );
       indexRefreshSucceeded = true;
       if (indexRefreshed) {
@@ -714,7 +799,7 @@ export class DoomscrollView extends ItemView {
     } catch (error) {
       console.error('Error indexing vault:', error);
       if (loadingEl) {
-        loadingEl.textContent = 'Error indexing vault';
+        loadingEl.textContent = 'Could not prepare your notes';
       }
     } finally {
       this.setRefreshing(false);
@@ -745,9 +830,16 @@ export class DoomscrollView extends ItemView {
     this.restoreScrollPosition();
   }
 
+  private updateFeedTitle(): void {
+    const title = this.containerEl.querySelector<HTMLElement>(
+      '.doomscroll-title'
+    );
+    if (title) title.textContent = this.getDisplayText();
+  }
+
   private resolvePreviewPaths(paths: readonly string[]): NotePreview[] {
     return paths.flatMap((path) => {
-      const stored = this.plugin.data.previews[path];
+      const stored = this.plugin.getFeedPreviews(this.feedId)[path];
       return stored ? [toNotePreview(path, stored)] : [];
     });
   }
@@ -808,7 +900,7 @@ export class DoomscrollView extends ItemView {
   ): void {
     // Get fresh batch if not already loaded
     if (this.currentBatch.length === 0) {
-      const candidates = Object.entries(this.plugin.data.previews)
+      const candidates = Object.entries(this.plugin.getFeedPreviews(this.feedId))
         .map(([path, stored]) => toNotePreview(path, stored))
         .filter(
           (preview) => this.shouldIncludePreview(preview)
@@ -843,7 +935,6 @@ export class DoomscrollView extends ItemView {
     this.renderedSimplifiedView = this.isSimplifiedView();
     this.renderedPreviewSize = this.getPreviewSize();
     this.renderedFrontmatterPropertiesKey = this.getFrontmatterPropertiesKey();
-    this.updateBackButton();
 
     // Stop observing cards from the previous batch before replacing them.
     this.cardObserver?.disconnect();
@@ -971,7 +1062,7 @@ export class DoomscrollView extends ItemView {
       const loadedPaths = new Set(
         this.currentBatch.map((preview) => preview.path)
       );
-      const candidates = Object.entries(this.plugin.data.previews)
+      const candidates = Object.entries(this.plugin.getFeedPreviews(this.feedId))
         .map(([path, stored]) => toNotePreview(path, stored))
         .filter(
           (preview) =>
@@ -1029,12 +1120,21 @@ export class DoomscrollView extends ItemView {
     this.setRefreshing(true);
 
     try {
-      let indexRefreshed = await this.plugin.indexer.refreshIfStale();
+      let indexRefreshed = await this.plugin.indexer.refreshIfStale(
+        undefined,
+        false,
+        this.getActiveFeedFilters(),
+        this.feedId
+      );
       // Settings may have changed while the first rebuild was in progress.
       // Run the indexer again for the final settings before selecting a batch.
       if (this.batchSettingsKey !== this.getBatchSettingsKey()) {
-        indexRefreshed =
-          (await this.plugin.indexer.refreshIfStale()) || indexRefreshed;
+        indexRefreshed = (await this.plugin.indexer.refreshIfStale(
+          undefined,
+          false,
+          this.getActiveFeedFilters(),
+          this.feedId
+        )) || indexRefreshed;
       }
 
       const settingsChanged =
@@ -1079,14 +1179,6 @@ export class DoomscrollView extends ItemView {
     this.getFeedScrollElement()?.scrollTo({ top: 0 });
   }
 
-  private updateBackButton(): void {
-    if (this.backButton) {
-      this.backButton.disabled =
-        this.batchHistoryCursor < 0 ||
-        this.batchHistoryCursor >= this.batchHistory.length - 1;
-    }
-  }
-
   private renderBatch(previousOrder?: readonly string[]): void {
     const body = this.containerEl.querySelector('.doomscroll-body');
     if (body) {
@@ -1120,7 +1212,7 @@ export class DoomscrollView extends ItemView {
   private setRefreshing(refreshing: boolean): void {
     this.isRefreshing = refreshing;
     if (this.refreshStatusEl) {
-      this.refreshStatusEl.textContent = refreshing ? 'Indexing…' : '';
+      this.refreshStatusEl.textContent = refreshing ? 'Preparing notes…' : '';
     }
 
     const buttons = this.containerEl.querySelectorAll<HTMLButtonElement>(
@@ -1130,48 +1222,59 @@ export class DoomscrollView extends ItemView {
       button.disabled = refreshing;
       if (button.classList.contains('doomscroll-reshuffle-end-btn')) {
         const defaultLabel = button.dataset.defaultLabel ?? 'Reshuffle';
-        button.textContent = refreshing ? 'Indexing…' : defaultLabel;
+        button.textContent = refreshing ? 'Preparing notes…' : defaultLabel;
       }
     });
   }
 
   private getBatchSettingsKey(): string {
-    const {
-      simplifiedView: _simplifiedView,
-      reduceAnimations: _reduceAnimations,
-      previewSize: _previewSize,
-      frontmatterBeforeProps: _frontmatterBeforeProps,
-      frontmatterAfterProps: _frontmatterAfterProps,
-      ...batchSettings
-    } = this.plugin.data.settings;
-    return JSON.stringify(batchSettings);
+    const { batchSize, infiniteScroll, headerScrollsWithFeed } = this.plugin.data.settings;
+    const feedFilters = this.getActiveFeedFilters();
+    return JSON.stringify({
+      batchSize,
+      infiniteScroll,
+      headerScrollsWithFeed,
+      feedFilters: {
+        includeMediaOnlyNotes: feedFilters.includeMediaOnlyNotes,
+        showNonMarkdownFiles: feedFilters.showNonMarkdownFiles,
+        frontmatterImageProps: feedFilters.frontmatterImageProps,
+        searchQuery: feedFilters.searchQuery,
+        excludeFolders: feedFilters.excludeFolders,
+        excludeTags: feedFilters.excludeTags,
+        excludeGlobs: feedFilters.excludeGlobs,
+      },
+    });
+  }
+
+  private getActiveFeedFilters() {
+    return this.plugin.getFeedFilters(this.feedId);
   }
 
   private shouldIncludePreview(preview: NotePreview): boolean {
     if (preview.attachment) {
-      return this.plugin.data.settings.showNonMarkdownFiles;
+      return this.getActiveFeedFilters().showNonMarkdownFiles;
     }
     return (
-      this.plugin.data.settings.includeMediaOnlyNotes ||
+      this.getActiveFeedFilters().includeMediaOnlyNotes ||
       !isMediaOnlyPreview(preview)
     );
   }
 
   private getFrontmatterPropertiesKey(): string {
     return JSON.stringify({
-      before: this.plugin.data.settings.frontmatterBeforeProps ?? [],
-      after: this.plugin.data.settings.frontmatterAfterProps ?? [],
+      before: this.getActiveFeedFilters().frontmatterBeforeProps ?? [],
+      after: this.getActiveFeedFilters().frontmatterAfterProps ?? [],
     });
   }
 
   private isSimplifiedView(): boolean {
     // Treat missing values from pre-setting data.json files as the default.
-    return this.plugin.data.settings.simplifiedView !== false;
+    return this.getActiveFeedFilters().simplifiedView !== false;
   }
 
   private getPreviewSize(): PreviewSize {
-    return isPreviewSize(this.plugin.data.settings.previewSize)
-      ? this.plugin.data.settings.previewSize
+    return isPreviewSize(this.getActiveFeedFilters().previewSize)
+      ? this.getActiveFeedFilters().previewSize
       : 'medium';
   }
 
@@ -1198,7 +1301,7 @@ export class DoomscrollView extends ItemView {
 
     const clone = renderedRoot.cloneNode(true) as HTMLElement;
     if (clone.childNodes.length === 0) {
-      snippetEl.textContent = '(no preview text)';
+      snippetEl.textContent = '(No text to preview)';
       return;
     }
     snippetEl.replaceChildren(...Array.from(clone.childNodes));
@@ -1390,7 +1493,7 @@ export class DoomscrollView extends ItemView {
 
     const file = this.plugin.app.vault.getAbstractFileByPath(preview.path);
     if (!(file instanceof TFile)) {
-      if (isCurrent()) snippetEl.textContent = '(no preview text)';
+      if (isCurrent()) snippetEl.textContent = '(No text to preview)';
       return;
     }
 
@@ -1456,7 +1559,7 @@ export class DoomscrollView extends ItemView {
     } catch (error) {
       console.error(`Error rendering preview for ${file.path}:`, error);
       if (isCurrent()) {
-        snippetEl.textContent = preview.snippet ?? '(no preview text)';
+        snippetEl.textContent = preview.snippet ?? '(No text to preview)';
       }
     }
   }
@@ -1618,7 +1721,8 @@ export class DoomscrollView extends ItemView {
       this.containerEl.querySelectorAll<HTMLElement>('.doomscroll-card')
     ).find((candidate) => candidate.dataset.path === path);
 
-    const hadPreview = path in this.plugin.data.previews;
+    const previews = this.plugin.getFeedPreviews(this.feedId);
+    const hadPreview = path in previews;
     const hadHistory = this.plugin.data.history.some(
       (entry) => entry.path === path
     );
@@ -1649,7 +1753,7 @@ export class DoomscrollView extends ItemView {
     this.batchHistoryCursor = nextBatches.batchHistoryCursor;
     this.viewedPathsInBatch.delete(path);
 
-    delete this.plugin.data.previews[path];
+    delete previews[path];
     this.plugin.data.history = this.plugin.data.history.filter(
       (entry) => entry.path !== path
     );
@@ -1661,7 +1765,6 @@ export class DoomscrollView extends ItemView {
       }
     }
 
-    this.updateBackButton();
     await this.plugin.saveSettings();
   }
 
@@ -1672,7 +1775,7 @@ export class DoomscrollView extends ItemView {
       // A very quick tap can happen before IntersectionObserver fires.
       this.recordViewedPath(preview.path);
 
-      const behavior = this.plugin.data.settings.openNoteBehavior;
+      const behavior = this.getActiveFeedFilters().openNoteBehavior;
       const leaf =
         behavior === 'reuse'
           ? this.leaf
@@ -1889,8 +1992,8 @@ export class DoomscrollView extends ItemView {
     frontmatterEl.classList.add(`doomscroll-card-frontmatter-${position}`);
     const properties =
       position === 'before'
-        ? this.plugin.data.settings.frontmatterBeforeProps ?? []
-        : this.plugin.data.settings.frontmatterAfterProps ?? [];
+        ? this.getActiveFeedFilters().frontmatterBeforeProps ?? []
+        : this.getActiveFeedFilters().frontmatterAfterProps ?? [];
     this.renderFrontmatterProperties(preview, frontmatterEl, properties);
     if (frontmatterEl.childElementCount === 0) {
       frontmatterEl.remove();
@@ -2147,7 +2250,7 @@ function isMediaOnlyPreview(preview: NotePreview): boolean {
 
   // Older cached previews predate the explicit mediaOnly flag.
   return (
-    (Boolean(preview.imagePath) && preview.snippet === '(no preview text)') ||
+    (Boolean(preview.imagePath) && preview.snippet === '(No text to preview)') ||
     /^📎 .+ attached$/.test(preview.snippet ?? '')
   );
 }
@@ -2177,6 +2280,8 @@ function parseViewState(state: unknown): DoomscrollViewState | null {
       ? { path: rawAnchor.path, topOffset: rawAnchor.topOffset }
       : null;
   return {
+    feedId:
+      typeof state.feedId === 'string' ? state.feedId : 'default',
     batchPaths,
     batchHistoryPaths,
     batchHistoryCursor:

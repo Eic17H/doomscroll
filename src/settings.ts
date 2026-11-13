@@ -1,15 +1,20 @@
 import {
   AbstractInputSuggest,
   App,
+  Modal,
   Notice,
   normalizePath,
   PluginSettingTab,
-  requireApiVersion,
+  Platform,
   Setting,
+  type SettingDefinitionList,
   type SettingDefinitionItem,
+  type SettingGroupItem,
 } from 'obsidian';
 import DoomscrollPlugin from './main';
-import { isPreviewSize, PluginSettings } from './types';
+import { ShortcutsModal } from './help';
+import { uuidv7 } from './uuid';
+import { FeedFilters, isPreviewSize, PluginSettings } from './types';
 
 const GITHUB_URL = 'https://github.com/yaroshevych/doomscroll';
 const ISSUES_URL = `${GITHUB_URL}/issues`;
@@ -45,12 +50,70 @@ class FolderSuggest extends AbstractInputSuggest<string> {
   }
 
   selectSuggestion(path: string): void {
-    this.inputEl.value = path;
+    this.setValue(path);
     this.close();
   }
 }
 
+class DeleteFeedModal extends Modal {
+  constructor(app: App, private feedName: string, private onConfirm: () => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText('Delete feed?');
+    this.contentEl.createEl('p', {
+      text: `Delete “${this.feedName}”? Your notes will not be deleted.`,
+    });
+    new Setting(this.contentEl)
+      .addButton((button) => button.setButtonText('Cancel').onClick(() => this.close()))
+      .addButton((button) => button.setButtonText('Delete feed').setDestructive().onClick(() => {
+        this.close();
+        this.onConfirm();
+      }));
+  }
+}
+
+class ResetFeedModal extends Modal {
+  constructor(app: App, private onConfirm: () => void) { super(app); }
+  onOpen(): void {
+    this.titleEl.setText('Reset feed to defaults?');
+    this.contentEl.createEl('p', { text: 'This will reset the feed’s name, filters, and display settings.' });
+    new Setting(this.contentEl)
+      .addButton((button) => button.setButtonText('Cancel').onClick(() => this.close()))
+      .addButton((button) => button.setButtonText('Reset to defaults').setDestructive().onClick(() => {
+        this.close();
+        this.onConfirm();
+      }));
+  }
+}
+
+class AddExcludedFolderModal extends Modal {
+  constructor(app: App, private tab: DoomscrollSettingTab, private filters: FeedFilters) { super(app); }
+  onOpen(): void {
+    this.titleEl.setText('Add excluded folder');
+    let inputEl: HTMLInputElement;
+    new Setting(this.contentEl).setName('').setDesc('Choose a suggested folder, or type or paste its path')
+      .setClass('doomscroll-folder-picker-input doomscroll-folder-picker-field').addText((text) => {
+      text.setPlaceholder('4. Archive');
+      inputEl = text.inputEl;
+      new FolderSuggest(this.app, inputEl);
+    });
+    new Setting(this.contentEl).addButton((button) => button.setButtonText('Cancel').onClick(() => this.close()))
+      .addButton((button) => button.setButtonText('Add').setCta().onClick(async () => {
+        const folder = normalizeFolderPath(inputEl.value);
+        if (!folder || folder === '.') { new Notice('Enter a folder path inside your vault'); return; }
+        if (this.filters.excludeFolders.includes(folder)) { new Notice('That folder is already excluded'); return; }
+        this.filters.excludeFolders.push(folder);
+        await this.tab.saveExcludedFolders(this.filters);
+        this.close();
+      }));
+  }
+}
+
 export const DEFAULT_SETTINGS: PluginSettings = {
+  id: '',
+  name: 'Default feed',
   batchSize: 20,
   infiniteScroll: false,
   headerScrollsWithFeed: false,
@@ -67,10 +130,14 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   frontmatterImageProps: ['cover', 'image', 'banner'],
   frontmatterBeforeProps: [],
   frontmatterAfterProps: [],
+  additionalFeeds: [],
 };
 
 export class DoomscrollSettingTab extends PluginSettingTab {
   plugin: DoomscrollPlugin;
+  private legacyFrontmatter: string | null = null;
+  private openPageNames = new Map<string, string>();
+  private renameObservers = new Map<string, MutationObserver>();
 
   constructor(app: App, plugin: DoomscrollPlugin) {
     super(app, plugin);
@@ -78,19 +145,15 @@ export class DoomscrollSettingTab extends PluginSettingTab {
   }
 
   getSettingDefinitions(): SettingDefinitionItem[] {
-    return [
-      {
-        name: 'Doomscroll settings',
-        render: (setting) => configureHeader(setting),
-      },
+    const definitions: SettingDefinitionItem[] = [
       {
         name: 'Infinite scrolling',
-        desc: 'Automatically load more notes as you reach the end of the feed',
+        desc: 'Load more notes when you reach the end of the feed',
         control: { type: 'toggle', key: 'infiniteScroll' },
       },
       {
-        name: 'Batch size',
-        desc: 'Number of cards to show per reshuffle. Does not apply while infinite scrolling is enabled.',
+        name: 'Notes per reshuffle',
+        desc: 'Choose how many cards to show when you reshuffle. This setting does not apply when infinite scrolling is on.',
         control: {
           type: 'dropdown',
           key: 'batchSize',
@@ -100,119 +163,276 @@ export class DoomscrollSettingTab extends PluginSettingTab {
       },
       {
         name: 'Header scrolls with feed',
-        desc: 'The header will scroll away from view',
+        desc: 'Hide the header as you scroll',
         control: { type: 'toggle', key: 'headerScrollsWithFeed' },
       },
       {
-        name: 'Include media-only notes',
-        desc: 'Show Markdown notes containing only images or other attachments',
-        control: { type: 'toggle', key: 'includeMediaOnlyNotes' },
-      },
-      {
-        name: 'Show non-Markdown files',
-        desc: 'Show standalone vault files such as images, PDFs, and other attachments',
-        control: { type: 'toggle', key: 'showNonMarkdownFiles' },
-      },
-      {
-        name: 'Simplified view',
-        desc: 'Show concise previews with readable tables, links, and code; turn off for full Markdown formatting.',
-        control: { type: 'toggle', key: 'simplifiedView' },
-      },
-      {
         name: 'Reduce animation',
-        desc: 'Disable card and scrolling animations during keyboard navigation',
+        desc: 'Turn off animations when using keyboard shortcuts',
         control: { type: 'toggle', key: 'reduceAnimations' },
       },
-      {
-        name: 'Preview size',
-        desc: 'How many lines of note text to show on each card',
-        control: {
-          type: 'dropdown',
-          key: 'previewSize',
-          options: { small: 'Small', medium: 'Medium', large: 'Large' },
-        },
-      },
-      {
-        name: 'Search query',
-        desc: 'Filter notes using Obsidian-style search syntax, such as tag:#work or [status:Draft]',
-        control: {
-          type: 'text',
-          key: 'searchQuery',
-          placeholder: 'tag:#work [status:Draft]',
-        },
-      },
-      {
-        name: 'Open notes in',
-        desc: 'Choose where a card opens',
-        control: {
-          type: 'dropdown',
-          key: 'openNoteBehavior',
-          options: { tab: 'New tab', reuse: 'Reuse current tab', window: 'New window' },
-        },
-      },
-      {
-        name: 'Exclude tags',
-        desc: 'Tags to skip without # (one per line)',
-        control: { type: 'textarea', key: 'excludeTags' },
-      },
-      {
-        name: 'Exclude filename patterns',
-        desc: 'Filename patterns to skip (one per line, e.g., _*)',
-        control: { type: 'textarea', key: 'excludeGlobs' },
-      },
-      {
-        name: 'Frontmatter image properties',
-        desc: 'Property names to check for images in frontmatter (one per line)',
-        control: { type: 'textarea', key: 'frontmatterImageProps' },
-      },
-      {
-        name: 'Frontmatter properties before preview',
-        desc: 'Property names to render before the note body (one per line)',
-        control: { type: 'textarea', key: 'frontmatterBeforeProps' },
-      },
-      {
-        name: 'Frontmatter properties after preview',
-        desc: 'Property names to render after the note body (one per line)',
-        control: { type: 'textarea', key: 'frontmatterAfterProps' },
-      },
-      {
-        name: 'Excluded folders',
-        render: (setting) => {
-          setting.setName('Excluded folders').setHeading();
-          const list = setting.settingEl.createDiv(
-            'doomscroll-excluded-folders-list'
-          );
-          this.renderExcludedFolders(list);
-        },
-      },
-      {
-        name: 'Add excluded folder',
-        desc: 'Folders to skip (type or choose a folder)',
-        render: (setting) => {
-          setting.setName('Add excluded folder').setDesc('Folders to skip (type or choose a folder)');
-          let folderInputEl: HTMLInputElement | null = null;
-          setting.addText((text) => {
-            text.setPlaceholder('4. Archive');
-            folderInputEl = text.inputEl;
-            new FolderSuggest(this.app, text.inputEl);
-          });
-          setting.addButton((button) =>
-            button.setButtonText('Add').onClick(() => {
-              const folder = normalizeFolderPath(folderInputEl?.value ?? '');
-              if (!folder || folder === '.') {
-                new Notice('Excluded folder path cannot be empty or the vault root');
-                return;
-              }
-              if (this.plugin.data.settings.excludeFolders.includes(folder)) {
-                new Notice('That folder is already excluded');
-                return;
-              }
-              void this.addExcludedFolder(folder, folderInputEl);
-            })
-          );
-        },
-      },
     ];
+
+    const feedItems: SettingGroupItem[] = [
+      { name: 'Feeds', desc: FEEDS_DESCRIPTION },
+    ];
+    const usedNames = new Set<string>();
+    const addFeedPage = (fallback: string, feed: FeedFilters) => {
+      const base = this.openPageNames.get(feed.id) ?? (feed.name.trim() || fallback);
+      let name = base;
+      let suffix = 2;
+      while (usedNames.has(name)) name = `${base} (${suffix++})`;
+      usedNames.add(name);
+      const group = this.createFeedDefinition(fallback, feed, name);
+      const pageActions: SettingGroupItem[] = feed === this.plugin.data.settings
+        ? [{ name: 'Reset action', render: (setting: Setting) => {
+            setting.setName('').addButton((button) => button
+              .setButtonText('Reset to defaults').setDestructive()
+              .onClick(() => new ResetFeedModal(this.app, () => { void this.resetDefaultFeed(); }).open()));
+          } }]
+        : [{ name: 'Delete action', render: (setting: Setting) => {
+            setting.setName('').addButton((button) => button
+              .setButtonText('Delete feed').setDestructive()
+              .onClick(() => this.confirmDeleteFeed(feed, setting.settingEl.closest('.setting-page'))));
+          } }];
+      feedItems.push({ type: 'page', name, items: [group, ...pageActions] });
+    };
+    addFeedPage('Default feed', this.plugin.data.settings);
+    this.plugin.data.settings.additionalFeeds.forEach((feed, index) => {
+      addFeedPage(`Feed ${index + 1}`, feed);
+    });
+    feedItems.push({
+      name: 'Add feed',
+      render: (setting) => {
+        setting.setClass('doomscroll-add-feed').addButton((button) =>
+          button.setButtonText('Add feed').onClick(() => {
+            void this.addFeed();
+          })
+        );
+      },
+    });
+    definitions.push({ type: 'group', items: feedItems });
+    definitions.push({
+      type: 'group',
+      items: [
+        { name: 'Help & support', render: (setting) => configureGitHubLinks(setting, this.app) },
+      ],
+    });
+
+    return definitions;
+  }
+
+  private createFeedDefinition(
+    heading: string,
+    filters: FeedFilters,
+    pageName: string
+  ): SettingDefinitionItem {
+    return {
+      type: 'group',
+      cls: 'doomscroll-feed-filters',
+      items: [
+        {
+          name: 'Name',
+          render: (setting) => {
+            this.openPageNames.set(filters.id, pageName);
+            setting
+              .setName('Name')
+              .addText((text) =>
+                text
+                  .setValue(filters.name)
+                  .onChange(async (value) => {
+                    filters.name = value;
+                    this.refreshFeedNameAfterLeavingPage(setting.settingEl, filters.id);
+                    await this.plugin.saveSettings();
+                    this.plugin.refreshFeedCommands();
+                  })
+              );
+          },
+        },
+        {
+          name: 'Search query',
+          render: (setting) => {
+            setting
+              .setClass('doomscroll-search-query')
+              .setName('Search query')
+              .setDesc('Choose notes using an Obsidian search, such as tag:#work or [status:Draft]. You can build your search in Obsidian’s Search sidebar and copy it here.')
+              .addText((text) =>
+                text
+                  .setPlaceholder('tag:#work [status:Draft]')
+                  .setValue(filters.searchQuery)
+                  .onChange(async (value) => {
+                    filters.searchQuery = value;
+                    await this.saveFeedSettings(filters);
+                  })
+              );
+          },
+        },
+        ...this.createFeedOptions(filters),
+        {
+          type: 'page',
+          name: 'Note properties',
+          desc: 'Choose which note properties to show in previews',
+          items: [{
+            type: 'group',
+            items: this.createFrontmatterOptions(filters).map((option) => ({
+              name: option.name,
+              render: (setting: Setting) => {
+                setting.setClass('doomscroll-large-text-editor');
+                option.render(setting);
+              },
+            })),
+          }],
+        },
+        {
+          type: 'page',
+          name: 'Exclusions',
+          desc: 'Exclude notes by tag, filename pattern, or folder',
+          items: [{ type: 'group', cls: 'doomscroll-feed-filters', items: [
+        {
+          name: 'Exclude tags',
+          render: (setting) => {
+            setting
+              .setClass('doomscroll-large-text-editor')
+              .setName('Exclude tags')
+              .setDesc('Enter tags to leave out, one per line, without #.')
+              .addTextArea((text) =>
+                text
+                  .setPlaceholder('archive\nprivate\nignore')
+                  .setValue(filters.excludeTags.join('\n'))
+                  .onChange(async (value) => {
+                    filters.excludeTags = parseLines(value);
+                    await this.saveFeedSettings(filters);
+                  })
+              );
+          },
+        },
+        {
+          name: 'Exclude filename patterns',
+          render: (setting) => {
+            setting
+              .setClass('doomscroll-large-text-editor')
+              .setName('Exclude filename patterns')
+              .setDesc('Enter one pattern per line. For example, _* excludes filenames starting with _.')
+              .addTextArea((text) =>
+                text
+                  .setPlaceholder('_*\nDraft*\nMOC*')
+                  .setValue(filters.excludeGlobs.join('\n'))
+                  .onChange(async (value) => {
+                    filters.excludeGlobs = parseLines(value);
+                    await this.saveFeedSettings(filters);
+                  })
+              );
+          },
+        },
+          ] }, this.createExcludedFoldersGroup(filters)],
+        },
+      ],
+    };
+  }
+
+  private async saveFeedSettings(filters: FeedFilters): Promise<void> {
+    await this.plugin.saveSettingsAndRefreshViews();
+  }
+
+  private async resetDefaultFeed(): Promise<void> {
+    const feed = this.plugin.data.settings;
+    const id = feed.id;
+    Object.assign(feed, {
+      name: 'Doomscroll',
+      includeMediaOnlyNotes: DEFAULT_SETTINGS.includeMediaOnlyNotes,
+      showNonMarkdownFiles: DEFAULT_SETTINGS.showNonMarkdownFiles,
+      simplifiedView: DEFAULT_SETTINGS.simplifiedView,
+      previewSize: DEFAULT_SETTINGS.previewSize,
+      openNoteBehavior: DEFAULT_SETTINGS.openNoteBehavior,
+      frontmatterImageProps: [...DEFAULT_SETTINGS.frontmatterImageProps],
+      frontmatterBeforeProps: [...DEFAULT_SETTINGS.frontmatterBeforeProps],
+      frontmatterAfterProps: [...DEFAULT_SETTINGS.frontmatterAfterProps],
+      searchQuery: DEFAULT_SETTINGS.searchQuery,
+      excludeTags: [...DEFAULT_SETTINGS.excludeTags],
+      excludeGlobs: [...DEFAULT_SETTINGS.excludeGlobs],
+      excludeFolders: [...DEFAULT_SETTINGS.excludeFolders],
+      id,
+    });
+    for (const preview of Object.values(this.plugin.getFeedPreviews('default'))) {
+      preview.mtime = 0;
+    }
+    await this.saveFeedSettings(feed);
+    this.plugin.refreshFeedCommands();
+    this.update();
+  }
+
+  async saveExcludedFolders(filters: FeedFilters): Promise<void> {
+    await this.saveFeedSettings(filters);
+    this.update();
+  }
+
+  private createExcludedFoldersGroup(filters: FeedFilters): SettingDefinitionList {
+    return {
+      type: 'list',
+      heading: 'Excluded folders',
+      emptyState: 'No excluded folders',
+      items: filters.excludeFolders.map((folder) => ({ name: folder })),
+      addItem: {
+        name: 'Add folder',
+        action: () => { new AddExcludedFolderModal(this.app, this, filters).open(); },
+      },
+      onDelete: (index) => {
+        filters.excludeFolders.splice(index, 1);
+        void this.saveExcludedFolders(filters);
+      },
+    } satisfies SettingDefinitionList;
+  }
+
+  private refreshFeedNameAfterLeavingPage(settingEl: HTMLElement, feedId: string): void {
+    if (this.renameObservers.has(feedId)) return;
+    const page = settingEl.closest('.setting-page');
+    if (!page) return;
+    const observer = new MutationObserver(() => {
+      if (page.isConnected) return;
+      observer.disconnect();
+      this.renameObservers.delete(feedId);
+      this.openPageNames.delete(feedId);
+      this.update();
+    });
+    this.renameObservers.set(feedId, observer);
+    observer.observe(page.ownerDocument.body, { childList: true, subtree: true });
+  }
+
+  private async addFeed(): Promise<void> {
+    const defaults = this.plugin.data.settings;
+    this.plugin.data.settings.additionalFeeds.push({
+      id: uuidv7(),
+      name: `Feed ${this.plugin.data.settings.additionalFeeds.length + 1}`,
+      includeMediaOnlyNotes: defaults.includeMediaOnlyNotes,
+      showNonMarkdownFiles: defaults.showNonMarkdownFiles,
+      simplifiedView: defaults.simplifiedView,
+      previewSize: defaults.previewSize,
+      openNoteBehavior: defaults.openNoteBehavior,
+      frontmatterImageProps: [...defaults.frontmatterImageProps],
+      frontmatterBeforeProps: [...defaults.frontmatterBeforeProps],
+      frontmatterAfterProps: [...defaults.frontmatterAfterProps],
+      searchQuery: defaults.searchQuery,
+      excludeTags: [...defaults.excludeTags],
+      excludeGlobs: [...defaults.excludeGlobs],
+      excludeFolders: [...defaults.excludeFolders],
+    });
+    await this.plugin.saveSettings();
+    this.plugin.refreshFeedCommands();
+    this.refreshDeclarativeSettings();
+  }
+
+  private confirmDeleteFeed(feed: FeedFilters, page: Element | null): void {
+    new DeleteFeedModal(this.app, feed.name.trim() || 'Untitled feed', () => {
+      void this.deleteFeed(feed, page);
+    }).open();
+  }
+
+  private async deleteFeed(feed: FeedFilters, page: Element | null): Promise<void> {
+    const index = this.plugin.data.settings.additionalFeeds.indexOf(feed);
+    if (index < 0) return;
+    page?.querySelector<HTMLElement>('.setting-page-back-button')?.click();
+    await this.plugin.removeAdditionalFeed(index);
+    this.refreshDeclarativeSettings();
   }
 
   getControlValue(key: string): unknown {
@@ -326,132 +546,66 @@ export class DoomscrollSettingTab extends PluginSettingTab {
     this.refreshDeclarativeSettings();
   }
 
-  private async addExcludedFolder(
-    folder: string,
-    inputEl: HTMLInputElement | null
-  ): Promise<void> {
-    this.plugin.data.settings.excludeFolders.push(folder);
-    await this.plugin.saveSettingsAndRefreshViews();
-    if (inputEl) inputEl.value = '';
-    this.refreshDeclarativeSettings();
-  }
+  private refreshDeclarativeSettings(): void { this.update(); }
 
-  private refreshDeclarativeSettings(): void {
-    if (requireApiVersion('1.13.0')) {
-      this.update();
-    }
-  }
-
-  private async removeExcludedFolder(
-    folder: string,
-    container: HTMLElement
-  ): Promise<void> {
-    const index = this.plugin.data.settings.excludeFolders.indexOf(folder);
-    if (index === -1) return;
-    this.plugin.data.settings.excludeFolders.splice(index, 1);
-    await this.plugin.saveSettingsAndRefreshViews();
-    this.renderExcludedFolders(container);
-  }
-
-  display(): void {
-    const { containerEl } = this;
-    containerEl.empty();
-
-    configureHeader(new Setting(containerEl));
-
-    let batchSizeSetting: Setting | null = null;
-    new Setting(containerEl)
-      .setName('Infinite scrolling')
-      .setDesc('Automatically load more notes as you reach the end of the feed')
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.data.settings.infiniteScroll)
-          .onChange(async (value) => {
-            this.plugin.data.settings.infiniteScroll = value;
-            batchSizeSetting?.setDisabled(value);
-            await this.plugin.saveSettingsAndRefreshViews();
-          })
-      );
-
-    batchSizeSetting = new Setting(containerEl)
-      .setName('Batch size')
-      .setDesc('Number of cards to show per reshuffle. Does not apply while infinite scrolling is enabled.')
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOptions({ '10': '10', '20': '20', '50': '50', '100': '100' })
-          .setValue(String(this.plugin.data.settings.batchSize))
-          .onChange(async (value) => {
-            this.plugin.data.settings.batchSize = Number(value);
-            await this.plugin.saveSettingsAndRefreshViews();
-          })
-      );
-    batchSizeSetting.setDisabled(this.plugin.data.settings.infiniteScroll);
-
-    new Setting(containerEl)
-      .setName('Header scrolls with feed')
-      .setDesc('The header will scroll away from view')
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.data.settings.headerScrollsWithFeed)
-          .onChange(async (value) => {
-            this.plugin.data.settings.headerScrollsWithFeed = value;
-            await this.plugin.saveSettingsAndRefreshViews();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName('Include media-only notes')
+  private createFeedOptions(filters: FeedFilters): Array<{ name: string; render: (setting: Setting) => void }> {
+    return [
+      {
+        name: 'Include notes with only attachments',
+        render: (setting) => {
+          setting
+      .setName('Include notes with only attachments')
       .setDesc('Show Markdown notes containing only images or other attachments')
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.data.settings.includeMediaOnlyNotes)
+          .setValue(filters.includeMediaOnlyNotes)
           .onChange(async (value) => {
-            this.plugin.data.settings.includeMediaOnlyNotes = value;
-            await this.plugin.saveSettingsAndRefreshViews();
+            filters.includeMediaOnlyNotes = value;
+            await this.saveFeedSettings(filters);
           })
       );
-
-    new Setting(containerEl)
-      .setName('Show non-Markdown files')
-      .setDesc('Show standalone vault files such as images, PDFs, and other attachments')
+        },
+      },
+      {
+        name: 'Show unlinked attachments',
+        render: (setting) => {
+          setting
+      .setName('Show unlinked attachments')
+      .setDesc('Show files such as images and PDFs that are not linked from a note')
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.data.settings.showNonMarkdownFiles)
+          .setValue(filters.showNonMarkdownFiles)
           .onChange(async (value) => {
-            this.plugin.data.settings.showNonMarkdownFiles = value;
-            await this.plugin.saveSettingsAndRefreshViews();
+            filters.showNonMarkdownFiles = value;
+            await this.saveFeedSettings(filters);
           })
       );
-
-    new Setting(containerEl)
+        },
+      },
+      {
+        name: 'Simplified view',
+        render: (setting) => {
+          setting
       .setName('Simplified view')
       .setDesc(
-        'Show concise previews with readable tables, links, and code; turn off for full Markdown formatting.'
+        'Show simpler previews with less formatting'
       )
       .addToggle((toggle) =>
         toggle
-          .setValue(this.plugin.data.settings.simplifiedView !== false)
+          .setValue(filters.simplifiedView !== false)
           .onChange(async (value) => {
-            this.plugin.data.settings.simplifiedView = value;
-            await this.plugin.saveSettingsAndRefreshViews();
+            filters.simplifiedView = value;
+            await this.saveFeedSettings(filters);
           })
       );
-
-    new Setting(containerEl)
-      .setName('Reduce animation')
-      .setDesc('Disable card and scrolling animations during keyboard navigation')
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.data.settings.reduceAnimations)
-          .onChange(async (value) => {
-            this.plugin.data.settings.reduceAnimations = value;
-            await this.plugin.saveSettingsAndRefreshViews();
-          })
-      );
-
-    new Setting(containerEl)
+        },
+      },
+      {
+        name: 'Preview size',
+        render: (setting) => {
+          setting
       .setName('Preview size')
-      .setDesc('How many lines of note text to show on each card')
+      .setDesc('How many lines of note text to show')
       .addDropdown((dropdown) =>
         dropdown
           .addOptions({
@@ -459,32 +613,20 @@ export class DoomscrollSettingTab extends PluginSettingTab {
             medium: 'Medium',
             large: 'Large',
           })
-          .setValue(this.plugin.data.settings.previewSize)
+          .setValue(filters.previewSize)
           .onChange(async (value) => {
             if (!isPreviewSize(value)) return;
-            this.plugin.data.settings.previewSize = value;
-            await this.plugin.saveSettingsAndRefreshViews();
+            filters.previewSize = value;
+            await this.saveFeedSettings(filters);
           })
       );
-
-    new Setting(containerEl)
-      .setName('Search query')
-      .setDesc(
-        'Filter notes using Obsidian-style search syntax, such as tag:#work or [status:Draft]'
-      )
-      .addText((text) =>
-        text
-          .setPlaceholder('tag:#work [status:Draft]')
-          .setValue(this.plugin.data.settings.searchQuery)
-          .onChange(async (value) => {
-            this.plugin.data.settings.searchQuery = value;
-            await this.plugin.saveSettingsAndRefreshViews();
-          })
-      );
-
-    new Setting(containerEl)
+        },
+      },
+      {
+        name: 'Open notes in',
+        render: (setting) => {
+          setting
       .setName('Open notes in')
-      .setDesc('Choose where a card opens')
       .addDropdown((dropdown) =>
         dropdown
           .addOptions({
@@ -492,154 +634,98 @@ export class DoomscrollSettingTab extends PluginSettingTab {
             reuse: 'Reuse current tab',
             window: 'New window',
           })
-          .setValue(this.plugin.data.settings.openNoteBehavior)
+          .setValue(filters.openNoteBehavior)
           .onChange(async (value) => {
             if (value !== 'tab' && value !== 'reuse' && value !== 'window') {
               return;
             }
-            this.plugin.data.settings.openNoteBehavior = value;
-            await this.plugin.saveSettingsAndRefreshViews();
+            filters.openNoteBehavior = value;
+            await this.saveFeedSettings(filters);
           })
       );
+        },
+      },
+    ];
+  }
 
-    new Setting(containerEl)
-      .setName('Exclude tags')
-      .setDesc('Tags to skip without # (one per line)')
-      .addTextArea((text) =>
-        text
-          .setValue(this.plugin.data.settings.excludeTags.join('\n'))
-          .onChange(async (value) => {
-            this.plugin.data.settings.excludeTags = parseLines(value);
-            await this.plugin.saveSettingsAndRefreshViews();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName('Exclude filename patterns')
-      .setDesc('Filename patterns to skip (one per line, e.g., _*)')
-      .addTextArea((text) =>
-        text
-          .setValue(this.plugin.data.settings.excludeGlobs.join('\n'))
-          .onChange(async (value) => {
-            this.plugin.data.settings.excludeGlobs = parseLines(value);
-            await this.plugin.saveSettingsAndRefreshViews();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName('Frontmatter image properties')
+  private createFrontmatterOptions(filters: FeedFilters): Array<{ name: string; render: (setting: Setting) => void }> {
+    return [
+      {
+        name: 'Image properties',
+        render: (setting) => {
+          setting
+      .setName('Image properties')
       .setDesc(
-        'Property names to check for images in frontmatter (one per line)'
+        'Enter the names of image properties, one per line. Images from these properties appear in previews.'
       )
       .addTextArea((text) =>
         text
-          .setValue(this.plugin.data.settings.frontmatterImageProps.join('\n'))
+          .setValue(filters.frontmatterImageProps.join('\n'))
           .onChange(async (value) => {
-            this.plugin.data.settings.frontmatterImageProps = parseLines(value);
-            await this.plugin.saveSettingsAndRefreshViews();
+            filters.frontmatterImageProps = parseLines(value);
+            const feedId = filters === this.plugin.data.settings ? 'default' : filters.id;
+            for (const preview of Object.values(this.plugin.getFeedPreviews(feedId))) {
+              preview.mtime = 0;
+            }
+            await this.saveFeedSettings(filters);
           })
       );
-
-    new Setting(containerEl)
-      .setName('Frontmatter properties before preview')
+        },
+      },
+      {
+        name: 'Properties above preview',
+        render: (setting) => {
+          setting
+      .setName('Properties above preview')
       .setDesc(
-        'Property names to render before the note body (one per line)'
+        'Enter property names to show before the note text, one per line.'
       )
       .addTextArea((text) =>
         text
           .setPlaceholder('title\nsource\nauthor')
           .setValue(
-            this.plugin.data.settings.frontmatterBeforeProps.join('\n')
+            filters.frontmatterBeforeProps.join('\n')
           )
           .onChange(async (value) => {
-            this.plugin.data.settings.frontmatterBeforeProps = parseLines(value);
-            await this.plugin.saveSettingsAndRefreshViews();
+            filters.frontmatterBeforeProps = parseLines(value);
+            await this.saveFeedSettings(filters);
           })
       );
-
-    new Setting(containerEl)
-      .setName('Frontmatter properties after preview')
+        },
+      },
+      {
+        name: 'Properties below preview',
+        render: (setting) => {
+          setting
+      .setName('Properties below preview')
       .setDesc(
-        'Property names to render after the note body (one per line)'
+        'Enter property names to show after the note text, one per line.'
       )
       .addTextArea((text) =>
         text
           .setPlaceholder('source\nauthor\npublished')
           .setValue(
-            this.plugin.data.settings.frontmatterAfterProps.join('\n')
+            filters.frontmatterAfterProps.join('\n')
           )
           .onChange(async (value) => {
-            this.plugin.data.settings.frontmatterAfterProps = parseLines(value);
-            await this.plugin.saveSettingsAndRefreshViews();
+            filters.frontmatterAfterProps = parseLines(value);
+            await this.saveFeedSettings(filters);
           })
       );
-
-    new Setting(containerEl).setName('Excluded folders').setHeading();
-
-    const excludedFoldersList = containerEl.createDiv(
-      'doomscroll-excluded-folders-list'
-    );
-    this.renderExcludedFolders(excludedFoldersList);
-
-    let folderInputEl: HTMLInputElement;
-    new Setting(containerEl)
-      .setName('Add excluded folder')
-      .setDesc('Folders to exclude from the feed')
-      .addText((text) => {
-        text.setPlaceholder('4. Archive');
-        folderInputEl = text.inputEl;
-        new FolderSuggest(this.app, folderInputEl);
-      })
-      .addButton((button) =>
-        button.setButtonText('Add').onClick(async () => {
-          const folder = normalizeFolderPath(folderInputEl.value);
-          if (!folder || folder === '.') {
-            new Notice('Excluded folder path cannot be empty or the vault root');
-            return;
-          }
-          if (this.plugin.data.settings.excludeFolders.includes(folder)) {
-            new Notice('That folder is already excluded');
-            return;
-          }
-
-          this.plugin.data.settings.excludeFolders.push(folder);
-          await this.plugin.saveSettingsAndRefreshViews();
-          folderInputEl.value = '';
-          this.renderExcludedFolders(excludedFoldersList);
-        })
-      );
+        },
+      },
+    ];
   }
 
-  private renderExcludedFolders(container: HTMLElement): void {
-    container.empty();
-
-    if (this.plugin.data.settings.excludeFolders.length === 0) {
-      container.createDiv({ text: 'No excluded folders' });
-      return;
-    }
-
-    for (const folder of this.plugin.data.settings.excludeFolders) {
-      const row = container.createDiv('doomscroll-excluded-folder-item');
-      row.createSpan({ text: folder });
-      row
-        .createEl('button', {
-          text: '×',
-          cls: 'doomscroll-excluded-folder-remove',
-          attr: { 'aria-label': `Remove excluded folder ${folder}` },
-        })
-        .addEventListener('click', () => {
-          void this.removeExcludedFolder(folder, container);
-        });
-    }
-  }
 
 }
 
-function configureHeader(setting: Setting): void {
+const FEEDS_DESCRIPTION = 'Doomscroll starts with one feed. Rename it or change its settings, and add more feeds for different notes, such as your journal or books.';
+
+function configureGitHubLinks(setting: Setting, app: App): void {
   setting
-    .setClass('doomscroll-settings-header')
-    .setName('Doomscroll settings')
-    .setHeading()
+    .setClass('doomscroll-github-links')
+    .setName('Help & support')
     .addButton((button) =>
       button.setButtonText('GitHub').onClick(() => {
         window.open(GITHUB_URL, '_blank');
@@ -650,6 +736,11 @@ function configureHeader(setting: Setting): void {
         window.open(ISSUES_URL, '_blank');
       })
     );
+  if (!Platform.isMobile || Platform.isTablet) {
+    setting.addButton((button) => button.setButtonText('Keyboard shortcuts').onClick(() => {
+      new ShortcutsModal(app).open();
+    }));
+  }
 }
 
 function parseLines(value: string): string[] {
